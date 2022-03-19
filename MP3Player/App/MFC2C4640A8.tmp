@@ -1,0 +1,950 @@
+/************************************************************************************
+
+Copyright (c) 2001-2016  University of Washington Extension.
+
+Module Name:
+
+tasks.c
+
+Module Description:
+
+The tasks that are executed by the test application.
+
+2016/2 Nick Strathy adapted it for NUCLEO-F401RE 
+
+************************************************************************************/
+
+
+#include <stdarg.h>
+
+#include "bsp.h"
+#include "print.h"
+#include "mp3Util.h"
+
+// SD Card Library
+#include "SD.h"
+
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <Adafruit_ILI9341.h>
+#include <Adafruit_FT6206.h>
+
+Adafruit_ILI9341 lcdCtrl = Adafruit_ILI9341(); // The LCD controller
+
+Adafruit_FT6206 touchCtrl = Adafruit_FT6206(); // The touch controller
+
+
+Adafruit_GFX_Button playBottom;
+
+Adafruit_GFX_Button pauseBottom;
+
+Adafruit_GFX_Button nextBottom;
+
+Adafruit_GFX_Button previousBottom;
+
+Adafruit_GFX_Button haltBottom;
+
+
+#define PENRADIUS 3
+
+long MapTouchToScreen(long x, long in_min, long in_max, long out_min, long out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+#include "train_crossing.h"
+
+#define BUFSIZE 256
+
+// Music Previous Capacity
+// Should be modified to Total Numbers of Music Files you Have.
+const INT8U CAPACITY = 3;
+
+/************************************************************************************
+
+Allocate the stacks for each task.
+The maximum number of tasks the application can have is defined by OS_MAX_TASKS in os_cfg.h
+
+************************************************************************************/
+
+static OS_STK   LcdTouchTaskStk[APP_CFG_TASK_START_STK_SIZE];
+static OS_STK   Mp3SDTaskStk[APP_CFG_TASK_START_STK_SIZE];
+
+static OS_STK   ControlTaskStk[APP_CFG_TASK_START_STK_SIZE];
+
+static OS_STK   DisplayTaskStk[APP_CFG_TASK_START_STK_SIZE];
+
+// ---------------- Task prototypes  -------------------------------------------
+void LcdTouchTask(void* pdata); // Change (LcdTouchDemoTask) to Touch Task, Assert of buttons
+
+void ControlTask(void* pdata); // Actions Taken By Buttons
+
+void DisplayTask(void* pdata); // UI Display
+
+// Include ---- Display Task ---- 
+
+void Mp3SDTask(void* pdata);
+
+
+// -----------------------------------------------------------------------------
+OS_EVENT *musicStatus;
+
+// Useful functions
+void PrintToLcdWithBuf(char *buf, int size, char *format, ...);
+
+// Globals
+BOOLEAN nextSong = OS_FALSE;
+
+BOOLEAN stopSong = OS_FALSE;
+
+BOOLEAN prevSong = OS_FALSE;
+
+BOOLEAN haltPlayer = OS_TRUE; 
+
+// Inside ISR_M
+BOOLEAN isr_M = OS_FALSE;
+
+//BOOLEAN isr_items = OS_FALSE;
+
+// Event flags for synchronizing mailbox messages
+//OS_FLAG_GRP *btnFlags = 0;
+
+// Mutext
+OS_EVENT *pauseMutex;
+
+// Mail Box
+OS_EVENT * buttonMBox;
+
+// Mail Box
+OS_EVENT * songDisplay;
+
+// Mail Box
+OS_EVENT * music_Stats;
+
+//char *prevLists[] = {"music1.mp3", "music2.mp3", "music3.mp3"};
+
+//char *prevSong[] = { "music1", "music2", "music3" };
+
+//char *prevmusic[CAPACITY];
+
+File prevFiles[CAPACITY];
+
+typedef enum
+{
+  NONE_COMMAND,
+  PAUSE_COMMAND,
+  PLAY_COMMAND,
+  NEXT_COMMAND,
+  PREVIOUS_COMMAND,
+  HALT_COMMAND
+}ButtonControlsEnum;
+
+
+
+/************************************************************************************
+
+This task is the initial task running, started by main(). It starts
+the system tick timer and creates all the other tasks. Then it deletes itself.
+
+************************************************************************************/
+void StartupTask(void* pdata)
+{
+  // INT8U err;
+  
+  char buf[BUFSIZE];
+  
+  //INT8U err;
+  PjdfErrCode pjdfErr;
+  INT32U length;
+  static HANDLE hSD = 0;
+  static HANDLE hSPI = 0;
+  
+  PrintWithBuf(buf, BUFSIZE, "StartupTask: Begin\n");
+  // PrintWithBuf(buf, BUFSIZE, "StartupTask: Starting timer tick\n");
+  
+  // Start the system tick
+  SetSysTick(OS_TICKS_PER_SEC);
+  
+  // ----------- Create Flags and Mutex -------------------------------
+  
+  // btnFlags = OSFlagCreate(0x0,&err);
+  
+  buttonMBox = OSMboxCreate(NULL);
+  
+  songDisplay = OSMboxCreate(NULL);
+  
+  music_Stats = OSMboxCreate(NULL);
+  
+  // Initialize SD card
+  //PrintWithBuf(buf, PRINTBUFMAX, "Opening handle to SD driver: %s\n", PJDF_DEVICE_ID_SD_ADAFRUIT);
+  hSD = Open(PJDF_DEVICE_ID_SD_ADAFRUIT, 0);
+  if (!PJDF_IS_VALID_HANDLE(hSD)) while(1);
+  
+  
+  PrintWithBuf(buf, PRINTBUFMAX, "Opening SD SPI driver: %s\n", SD_SPI_DEVICE_ID);
+  // We talk to the SD controller over a SPI interface therefore
+  // open an instance of that SPI driver and pass the handle to 
+  // the SD driver.
+  hSPI = Open(SD_SPI_DEVICE_ID, 0);
+  if (!PJDF_IS_VALID_HANDLE(hSPI)) while(1);
+  
+  length = sizeof(HANDLE);
+  pjdfErr = Ioctl(hSD, PJDF_CTRL_SD_SET_SPI_HANDLE, &hSPI, &length);
+  if(PJDF_IS_ERROR(pjdfErr)) while(1);
+  
+  if (!SD.begin(hSD)) {
+    PrintWithBuf(buf, PRINTBUFMAX, "Attempt to initialize SD card failed.\n");
+  }
+  
+  // Create the test tasks
+  PrintWithBuf(buf, BUFSIZE, "StartupTask: Creating the application tasks\n");
+  
+  // The maximum number of tasks the application can have is defined by OS_MAX_TASKS in os_cfg.h
+  uint16_t task_prio =APP_TASK_TEST2_PRIO;
+  
+  // OSTaskCreate(Mp3DemoTask, (void*)0, &Mp3DemoTaskStk[APP_CFG_TASK_START_STK_SIZE-1], task_prio++);
+  
+  OSTaskCreate(LcdTouchTask, (void*)0, &LcdTouchTaskStk[APP_CFG_TASK_START_STK_SIZE-1], task_prio++);
+  
+  OSTaskCreate(Mp3SDTask, (void*)0, &Mp3SDTaskStk[APP_CFG_TASK_START_STK_SIZE-1], task_prio++);
+  
+  // Control Task Creation
+  OSTaskCreate(ControlTask, (void*)0, &ControlTaskStk[APP_CFG_TASK_START_STK_SIZE-1], task_prio++);
+  
+  // DisplayTask Creation
+  OSTaskCreate(DisplayTask, (void*)0, &DisplayTaskStk[APP_CFG_TASK_START_STK_SIZE-1], task_prio++);
+  
+  //pauseMutex = OSMutexCreate(task_prio++, &err);
+  
+  // Delete ourselves, letting the work be done in the new tasks.
+  //PrintWithBuf(buf, BUFSIZE, "StartupTask: deleting self\n");
+  OSTaskDel(OS_PRIO_SELF);
+}
+
+static void DrawLcdContents()
+{
+  char buf[BUFSIZE];
+  OS_CPU_SR cpu_sr;
+  
+  // allow slow lower pri drawing operation to finish without preemption
+  OS_ENTER_CRITICAL(); 
+  
+  lcdCtrl.fillScreen(ILI9341_BLACK);
+  
+  // Print a message on the LCD
+  lcdCtrl.setCursor(0, 0);
+  lcdCtrl.setTextColor(ILI9341_WHITE);  
+  lcdCtrl.setTextSize(2);
+  PrintToLcdWithBuf(buf, BUFSIZE, "Music Player");
+  
+  OS_EXIT_CRITICAL();
+  
+}
+
+void DisplaySong(char* string, INT16S x, INT16S y, INT16S w, INT16S h)
+{
+  char buf[BUFSIZE];
+  OS_CPU_SR cpu_sr;
+  
+  // allow slow lower pri drawing operation to finish without preemption
+  OS_ENTER_CRITICAL(); 
+  
+  // X, Y, W, H, COLOR
+  //lcdCtrl.fillRect(0,40,120,20,ILI9341_NAVY);
+  
+  lcdCtrl.fillRect(x,y,w, h,ILI9341_NAVY);
+    
+  // Print a message on the LCD
+  lcdCtrl.setCursor(x, y); // This was 0, 40
+  lcdCtrl.setTextColor(ILI9341_WHITE);  
+  lcdCtrl.setTextSize(2);
+  PrintToLcdWithBuf(buf, BUFSIZE, string);
+  
+  OS_EXIT_CRITICAL();
+  
+}
+
+
+/*******************************************************************************
+RUN SD TASK CODE
+********************************************************************************/
+
+void Mp3SDTask(void* pdata)
+{
+  PjdfErrCode pjdfErr;
+  INT32U length;
+  
+  char buf[BUFSIZE];
+  PrintWithBuf(buf, BUFSIZE, "Mp3DemoTask: starting\n");
+  
+  // PrintWithBuf(buf, BUFSIZE, "Opening MP3 driver: %s\n", PJDF_DEVICE_ID_MP3_VS1053);
+  // Open handle to the MP3 decoder driver
+  HANDLE hMp3 = Open(PJDF_DEVICE_ID_MP3_VS1053, 0);
+  if (!PJDF_IS_VALID_HANDLE(hMp3)) while(1);
+  
+  PrintWithBuf(buf, BUFSIZE, "Opening MP3 SPI driver: %s\n", MP3_SPI_DEVICE_ID);
+  // We talk to the MP3 decoder over a SPI interface therefore
+  // open an instance of that SPI driver and pass the handle to 
+  // the MP3 driver.
+  HANDLE hSPI = Open(MP3_SPI_DEVICE_ID, 0);
+  if (!PJDF_IS_VALID_HANDLE(hSPI)) while(1);
+  
+  length = sizeof(HANDLE);
+  pjdfErr = Ioctl(hMp3, PJDF_CTRL_MP3_SET_SPI_HANDLE, &hSPI, &length);
+  if(PJDF_IS_ERROR(pjdfErr)) while(1);
+  
+  // Send initialization data to the MP3 decoder and run a test
+  PrintWithBuf(buf, BUFSIZE, "Starting MP3 device test\n");
+  Mp3Init(hMp3);
+  int count = 0;
+  
+  //DrawBackGround();
+  
+  //OS_TIME()
+  
+  File dir = SD.open("/");
+  
+  while (1)
+  {
+    // Reset Values
+    INT8U counter = 0u;
+    
+    // ISR-M 
+    INT8U at_counter = 0u; // After Counter
+    INT8U lp_counter = 0u; // Looping Counter
+    
+    //INT8U diff = 0;
+    
+    while (1)
+    {
+      File entry;
+      
+      //char *test_name;
+      
+      // Check if we are in isr_M, and run those files, else read from SD Card.
+      
+      if(isr_M)
+      { 
+        
+        if(prevSong)
+        {
+          // Previous is True, Decrement LP_Counter;
+          lp_counter--;
+          
+          // Get File using Lp_Counter 
+          entry = prevFiles[lp_counter];
+          
+          // test_name = prevmusic[lp_counter];
+          
+          // Play Song 
+          PrintWithBuf(buf, BUFSIZE, "\nP-Begin streaming isr file: %d \n", lp_counter);       
+          
+          // PrintString(entry.name());
+          
+          //  Mp3StreamSDFile(hMp3, entry.name());           
+          
+          //  PrintWithBuf(buf, BUFSIZE, "\nP-Done streaming isr file  count=%d\n", ++count);     
+          
+          // Reset Previous Button
+          prevSong = OS_FALSE;
+          
+        }
+        else
+        {
+          if(nextSong || nextSong == OS_FALSE)
+          {
+            if(nextSong)
+            {
+              // Reset Button
+              nextSong = OS_FALSE;
+            }
+            
+            if(lp_counter < at_counter)
+            {
+              lp_counter++;
+              
+              // Only Play when Lpcounter != at_counter
+              // Get File using Lp_Counter 
+              entry = prevFiles[lp_counter];
+              
+              // Play Song 
+              PrintWithBuf(buf, BUFSIZE, "\nNP-Begin streaming isr file: %d\n", lp_counter);   
+              
+            }
+            else 
+            {
+              if(lp_counter == at_counter)
+              {
+                isr_M = OS_FALSE; // This will exit ISR_M
+              }
+            }
+            
+          }
+          
+        }
+        
+        //PrintString(entry.name());
+        
+        OSMboxPost(songDisplay,(void*)entry.name());
+        
+        Mp3StreamSDFile(hMp3, entry.name());          
+        
+        PrintWithBuf(buf, BUFSIZE, "\nDone streaming isr file at: %d", lp_counter);
+        
+        continue;
+        
+      }
+      else
+      {
+        entry = dir.openNextFile();
+        
+        if (!entry)
+        {
+          break;
+        }
+        if (entry.isDirectory())  // skip directories
+        {
+          entry.close();
+          continue;
+        }
+        
+        // Play Song 
+        PrintWithBuf(buf, BUFSIZE, "\nBegin streaming sd file  count=%d\n", ++count);    
+        
+        // Send Song Name
+        OSMboxPost(songDisplay,(void*)entry.name());
+        //songDisplay
+         
+       // PrintString(entry.name());
+        
+        Mp3StreamSDFile(hMp3, entry.name()); 
+        
+        PrintWithBuf(buf, BUFSIZE, "\nDone streaming sd file  count=%d\n", ++count);    
+        
+        //if(nextSong || prevSong)
+        // {        
+        counter = counter % CAPACITY; // Will Reset is Counter is Above Capacitor
+        
+        //prevmusic[counter] = entry.name();
+        
+        prevFiles[counter] = entry;
+        
+        // Increment Counter, Something In Previous List 
+        counter++;
+        
+        if(nextSong) // This was Next Button CLick
+        {
+          // Reset Next_Song to False
+          nextSong = OS_FALSE;
+        }
+        
+        // Insert Ourself Into isr_M
+        // This is our entry point of intersection 
+        if(isr_M == OS_FALSE && counter > 0 && prevSong)
+        {  
+          isr_M = OS_TRUE;
+          
+          // Set Up AC And LP
+          at_counter = counter - 1 ;
+          lp_counter = at_counter;
+          //diff = lp_counter;
+        }
+        
+        PrintWithBuf(buf, BUFSIZE, "FileSV =%d\n", counter);
+        
+        //}
+      }
+      
+      entry.close();
+    }
+    
+    dir.seek(0); // reset directory file to read again;
+    
+  }
+}
+
+/*******************************************************************************
+
+Runs Control Task code
+
+*******************************************************************************/
+
+void ControlTask(void* pdata)
+{
+  INT8U err;
+  char buf[BUFSIZE];
+  ButtonControlsEnum *BtnControl_type;
+  
+  
+  PrintWithBuf(buf, BUFSIZE,"Control Task building\n");
+  
+  //OS_CPU_SR  cpu_sr;
+  
+  //OS_ENTER_CRITICAL();
+  
+  
+  while(1)
+  {
+    
+    BtnControl_type = (ButtonControlsEnum*)OSMboxPend(buttonMBox,0,&err);
+    
+    ButtonControlsEnum* value = BtnControl_type;
+    
+    PrintWithBuf(buf, BUFSIZE,"Value: %d \t %d \n", value, (*value));
+   
+    char *music_status;
+    
+   
+    switch((int)BtnControl_type)
+    {
+    case NONE_COMMAND:
+      PrintString("None Command");
+      break;
+    case PAUSE_COMMAND:
+      playBottom.press(0); stopSong = OS_TRUE;
+      
+      music_status = "Paused";
+      // Add To Mail Box
+      OSMboxPost(music_Stats,(void*)music_status);
+      break;
+    case PLAY_COMMAND:
+      pauseBottom.press(0);  stopSong = OS_FALSE; haltPlayer = OS_FALSE;
+      music_status = "Playing";
+      // Add To Mail Box
+      OSMboxPost(music_Stats,(void*)music_status);
+      
+      break;
+    case NEXT_COMMAND:
+      prevSong = OS_FALSE;  nextSong = OS_TRUE;
+      // De-assert Button Pressed. 
+      nextBottom.press(0); 
+      break;
+    case PREVIOUS_COMMAND:
+      prevSong = OS_TRUE; nextSong = OS_FALSE;
+      // De-assert Previous Button. 
+      previousBottom.press(0); 
+      break;      
+    default:
+      // This is a Halt Assertion: HALT_COMMAND
+      PrintString("System Crashes: Exiting SYSTEM Crash");
+      
+      // Set Halt Player. Note : Only Play Button assertion can change it.
+      
+      haltPlayer = OS_TRUE;
+      
+       music_status = "Playing";
+      // Add To Mail Box
+      OSMboxPost(music_Stats,(void*)music_status);
+      
+      break;
+    }
+  }
+  
+  //OS_EXIT_CRITICAL();
+  //while (1) OSTimeDly(1000);
+  
+}
+
+/*******************************************************************************
+
+Runs Display Task Code
+
+*******************************************************************************/
+void DisplayTask(void* pdata)
+{
+  // Future reference: Song Status
+  
+  // Get Message Box Data
+  
+  INT8U err;
+  char *displayData;
+ // char *displayStats;
+  char buf[BUFSIZE];
+  PrintWithBuf(buf, BUFSIZE,"Display Task building\n");
+  
+  while(1)
+  {
+    // Display Music Status
+    
+    //displayStats = (char*)OSMboxPend(music_Stats,0,&err);
+    
+    // Display It
+   // DisplaySong(displayStats,0,90,120,20);
+    
+    // Get Something to Display.
+    displayData = (char*)OSMboxPend(songDisplay,0,&err);
+    
+    // Display It
+    DisplaySong(displayData,0,40,120,20);
+    
+  }
+  
+}
+
+/*
+static void PlayPauseContext()
+{
+OS_CPU_SR  cpu_sr;
+
+OS_ENTER_CRITICAL();
+
+pauseBottom.press(0);  stopSong = OS_FALSE;
+
+OS_EXIT_CRITICAL();
+}*/
+
+/*******************************************************************************
+
+Runs LCD/Touch  code
+
+*******************************************************************************/
+void LcdTouchTask(void* pdata)
+{
+  PjdfErrCode pjdfErr;
+  // INT8U err;
+  INT32U length;
+  
+  
+  //ButtonControlsEnum BtnControl_type;
+  
+  char buf[BUFSIZE];
+  PrintWithBuf(buf, BUFSIZE, "LcdTouchDemoTask: starting\n");
+  
+  PrintWithBuf(buf, BUFSIZE, "Opening LCD driver: %s\n", PJDF_DEVICE_ID_LCD_ILI9341);
+  // Open handle to the LCD driver
+  HANDLE hLcd = Open(PJDF_DEVICE_ID_LCD_ILI9341, 0);
+  if (!PJDF_IS_VALID_HANDLE(hLcd)) while(1);
+  
+  PrintWithBuf(buf, BUFSIZE, "Opening LCD SPI driver: %s\n", LCD_SPI_DEVICE_ID);
+  // We talk to the LCD controller over a SPI interface therefore
+  // open an instance of that SPI driver and pass the handle to 
+  // the LCD driver.
+  HANDLE hSPI = Open(LCD_SPI_DEVICE_ID, 0);
+  if (!PJDF_IS_VALID_HANDLE(hSPI)) while(1);
+  
+  length = sizeof(HANDLE);
+  pjdfErr = Ioctl(hLcd, PJDF_CTRL_LCD_SET_SPI_HANDLE, &hSPI, &length);
+  if(PJDF_IS_ERROR(pjdfErr)) while(1);
+  
+  PrintWithBuf(buf, BUFSIZE, "Initializing LCD controller\n");
+  lcdCtrl.setPjdfHandle(hLcd);
+  lcdCtrl.begin();
+  
+  DrawLcdContents();
+  
+  PrintWithBuf(buf, BUFSIZE, "Initializing FT6206 touchscreen controller\n");
+  
+  // DRIVER TODO
+  // Open a HANDLE for accessing device PJDF_DEVICE_ID_I2C1
+  // <your code here>
+  HANDLE hSPI1 = Open(PJDF_DEVICE_ID_I2C,0);
+  
+  if(!PJDF_IS_VALID_HANDLE(hSPI1))
+  {
+    while(1);
+  }
+  
+  // Call Ioctl on that handle to set the I2C device address to FT6206_ADDR
+  // <your code here>
+  //(void *)FT6206_ADDR
+  uint8_t address = FT6206_ADDR;
+  pjdfErr =  Ioctl(hSPI1, PJDF_CTRL_I2C_SET_DEVICE_ADDRESS, &address , &length);
+  if(PJDF_IS_ERROR(pjdfErr)) while(1);
+  
+  // Call setPjdfHandle() on the touch contoller to pass in the I2C handle
+  // <your code here>
+  touchCtrl.setPjdfHandle(hSPI1);
+  touchCtrl.begin();
+  
+  
+  if (! touchCtrl.begin(40)) {  // pass in 'sensitivity' coefficient
+    //PrintWithBuf(buf, BUFSIZE, "Couldn't start FT6206 touchscreen controller\n");
+    while (1);
+  }
+  
+  int currentcolor = ILI9341_RED;
+  
+  //  Adafruit_GFX_Button pauseBottom
+  pauseBottom = Adafruit_GFX_Button(); 
+  
+  // Adafruit_GFX_Button playBottom
+  playBottom  = Adafruit_GFX_Button();
+  
+  // Adafruit_GFX_Button nextBottom
+  nextBottom = Adafruit_GFX_Button();
+  
+  // Adafruit_GFX_Button haltBottom
+  haltBottom = Adafruit_GFX_Button();
+  
+  // Adafruit_GFX_Button previousBottom
+  previousBottom = Adafruit_GFX_Button();
+  
+  
+  pauseBottom.initButton(&lcdCtrl, ILI9341_TFTWIDTH-30, ILI9341_TFTHEIGHT-30, // x, y center of button
+                         60, 50, // width, height
+                         ILI9341_YELLOW, // outline
+                         ILI9341_BLACK, // fill
+                         ILI9341_YELLOW, // text color
+                         "Pause", // label
+                         1); // text size
+  pauseBottom.drawButton(0);
+  
+  
+  
+  playBottom.initButton(&lcdCtrl, ILI9341_TFTWIDTH-100, ILI9341_TFTHEIGHT-30, // x, y center of button
+                        60, 50, // width, height
+                        ILI9341_YELLOW, // outline
+                        ILI9341_BLACK, // fill
+                        ILI9341_YELLOW, // text color
+                        "Play", // label
+                        1); // text size
+  playBottom.drawButton(0);
+  
+  nextBottom.initButton(&lcdCtrl, ILI9341_TFTWIDTH-170, ILI9341_TFTHEIGHT-30, // x, y center of button
+                        60, 50, // width, height
+                        ILI9341_YELLOW, // outline
+                        ILI9341_BLACK, // fill
+                        ILI9341_YELLOW, // text color
+                        "Next", // label
+                        1); // text size
+  nextBottom.drawButton(0);
+  
+  previousBottom.initButton(&lcdCtrl, ILI9341_TFTWIDTH-170, ILI9341_TFTHEIGHT-90, // x, y center of button
+                            60, 50, // width, height
+                            ILI9341_YELLOW, // outline
+                            ILI9341_BLACK, // fill
+                            ILI9341_YELLOW, // text color
+                            "Previous", // label
+                            1); // text size
+  previousBottom.drawButton(0);
+  
+ 
+  haltBottom.initButton(&lcdCtrl, ILI9341_TFTWIDTH-30, ILI9341_TFTHEIGHT-90, // x, y center of button
+                         60, 50, // width, height
+                         ILI9341_YELLOW, // outline
+                         ILI9341_BLACK, // fill
+                         ILI9341_YELLOW, // text color
+                         "Stop", // label
+                         1); // text size
+  haltBottom.drawButton(0);
+  
+  // By Default this will be 0 - False.
+  // Meaning that is was Released
+  
+  pauseBottom.press(0);
+  
+  playBottom.press(0);
+  
+  nextBottom.press(0);
+  
+  previousBottom.press(0);
+  
+  while (1) { 
+    boolean touched;
+    
+    touched = touchCtrl.touched();
+    
+    if (! touched) {
+      OSTimeDly(5);
+      continue;
+    }
+    
+    TS_Point point;
+    
+    point = touchCtrl.getPoint();
+    if (point.x == 0 && point.y == 0)
+    {
+      continue; // usually spurious, so ignore
+    }
+    
+    // transform touch orientation to screen orientation.
+    TS_Point p = TS_Point();
+    p.x = MapTouchToScreen(point.x, 0, ILI9341_TFTWIDTH, ILI9341_TFTWIDTH, 0);
+    p.y = MapTouchToScreen(point.y, 0, ILI9341_TFTHEIGHT, ILI9341_TFTHEIGHT, 0);
+    
+    lcdCtrl.fillCircle(p.x, p.y, PENRADIUS, currentcolor);
+    
+    
+    if(pauseBottom.contains(p.x, p.y) && pauseBottom.isPressed() == 0)
+    {
+      
+      if(pauseBottom.justReleased() == 1 || pauseBottom.justPressed() == 0)
+      {
+        
+        // Assert Pause Button
+        pauseBottom.press(1); 
+        
+        if(pauseBottom.isPressed() == 1)
+        {
+          // Send Control Message to Mailbox
+          
+          PrintString("\nPause Asserted\n");
+          
+          // ButtonControlsEnum BtnControl_type1 = PAUSE_COMMAND ;
+          
+          OSMboxPost(buttonMBox,(void*)PAUSE_COMMAND);
+          
+        }
+        
+      } //OSTimeDly(100);
+      
+    }
+    else if(playBottom.contains(p.x, p.y) && playBottom.isPressed() == 0)
+    { 
+      
+      if(playBottom.justReleased() == 1 || playBottom.justPressed() == 0)
+      {
+        // Assert Play Button
+        playBottom.press(1); 
+        
+        // Call Interrupt
+        if(playBottom.isPressed() == 1)
+        {
+          // Send Control Message to Mailbox
+          
+          PrintString("\nPlay Asserted\n");
+          
+          // ButtonControlsEnum BtnControl_type = PLAY_COMMAND ;
+          
+          OSMboxPost(buttonMBox,(void*)PLAY_COMMAND);
+          
+        }
+      }
+      
+    }
+    else if (nextBottom.contains(p.x, p.y) && nextBottom.isPressed() == 0)
+    {
+      if(nextBottom.justReleased() == 1 || nextBottom.justPressed() == 0)
+      {
+        // Assert Next Button
+        nextBottom.press(1); 
+        
+        // Call Interrupt
+        if(nextBottom.isPressed() == 1)
+        {
+          
+          // Send Control Message to Mailbox
+          
+          PrintString("\nNext Asserted\n");
+          
+          // NEXT_COMMAND, PREVIOUS_COMMAND, previousBottom
+          
+          OSMboxPost(buttonMBox,(void*)NEXT_COMMAND);
+          
+        }
+      }
+    }
+    else if (previousBottom.contains(p.x, p.y) && previousBottom.isPressed() == 0)
+    {
+      if(previousBottom.justReleased() == 1 || previousBottom.justPressed() == 0)
+      {
+        // Assert Previous Button
+        previousBottom.press(1); 
+        
+        // Call Interrupt
+        if(previousBottom.isPressed() == 1)
+        {
+          // Send Control Message to Mailbox
+          
+          PrintString("\nPrevious Asserted\n");
+          
+          // NEXT_COMMAND, PREVIOUS_COMMAND, previousBottom
+          
+          OSMboxPost(buttonMBox,(void*)PREVIOUS_COMMAND);
+          
+        }
+      }
+    }//haltBottom
+    else if(haltBottom.contains(p.x, p.y) && haltBottom.isPressed() == 0)
+    {
+      if(haltBottom.justReleased() == 1 || haltBottom.justPressed() == 0)
+      {
+        // Assert Halt Button
+        haltBottom.press(1);
+        
+        // Send Button Clicked to Control Task
+        if(haltBottom.isPressed(1))
+        {
+           PrintString("\Halt Asserted\n");
+           
+          OSMboxPost(buttonMBox,(void*)HALT_COMMAND);
+        }
+      }
+    }
+    
+    OSTimeDly(100);
+    
+  } 
+  
+}
+
+/************************************************************************************
+
+Runs MP3 demo code
+
+************************************************************************************/
+/*void Mp3DemoTask(void* pdata)
+{
+PjdfErrCode pjdfErr;
+INT32U length;
+
+char buf[BUFSIZE];
+PrintWithBuf(buf, BUFSIZE, "Mp3DemoTask: starting\n");
+
+PrintWithBuf(buf, BUFSIZE, "Opening MP3 driver: %s\n", PJDF_DEVICE_ID_MP3_VS1053);
+// Open handle to the MP3 decoder driver
+HANDLE hMp3 = Open(PJDF_DEVICE_ID_MP3_VS1053, 0);
+if (!PJDF_IS_VALID_HANDLE(hMp3)) while(1);
+
+PrintWithBuf(buf, BUFSIZE, "Opening MP3 SPI driver: %s\n", MP3_SPI_DEVICE_ID);
+// We talk to the MP3 decoder over a SPI interface therefore
+// open an instance of that SPI driver and pass the handle to 
+// the MP3 driver.
+HANDLE hSPI = Open(MP3_SPI_DEVICE_ID, 0);
+if (!PJDF_IS_VALID_HANDLE(hSPI)) while(1);
+
+length = sizeof(HANDLE);
+pjdfErr = Ioctl(hMp3, PJDF_CTRL_MP3_SET_SPI_HANDLE, &hSPI, &length);
+if(PJDF_IS_ERROR(pjdfErr)) while(1);
+
+// Send initialization data to the MP3 decoder and run a test
+PrintWithBuf(buf, BUFSIZE, "Starting MP3 device test\n");
+Mp3Init(hMp3);
+int count = 0;
+
+while (1)
+{
+OSTimeDly(500);
+
+//if(stopSong == OS_FALSE)
+// {
+PrintWithBuf(buf, BUFSIZE, "Begin streaming sound file  count=%d\n", ++count);
+Mp3Stream(hMp3, (INT8U*)Train_Crossing, sizeof(Train_Crossing)); 
+PrintWithBuf(buf, BUFSIZE, "Done streaming sound file  count=%d\n", count);
+// }
+
+  }
+}
+*/
+
+// Renders a character at the current cursor position on the LCD
+static void PrintCharToLcd(char c)
+{
+  lcdCtrl.write(c);
+}
+
+/************************************************************************************
+
+Print a formated string with the given buffer to LCD.
+Each task should use its own buffer to prevent data corruption.
+
+************************************************************************************/
+void PrintToLcdWithBuf(char *buf, int size, char *format, ...)
+{
+  va_list args;
+  va_start(args, format);
+  PrintToDeviceWithBuf(PrintCharToLcd, buf, size, format, args);
+  va_end(args);
+}
+
+
+
+
